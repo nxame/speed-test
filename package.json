@@ -1,0 +1,16 @@
+{
+  "name": "@nxame/net-speed",
+  "version": "0.1.0",
+  "description": "Zero-dependency network speed test CLI.",
+  "type": "module",
+  "bin": {
+    "net-speed": "./src/cli.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "files": [
+    "src"
+  ],
+  "license": "MIT"
+}
