@@ -48,12 +48,28 @@ function parsePingOutput(output, count) {
   };
 }
 
-export function runPing({ host, count, timeoutMs }) {
+export function runPing({ host, count, timeoutMs, signal }) {
   return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(new Error('Aborted'));
+      return;
+    }
     const args = buildPingArgs({ host, count, timeoutMs });
     const proc = spawn('ping', args, { windowsHide: true });
+    let settled = false;
     let stdout = '';
     let stderr = '';
+
+    const onAbort = () => {
+      if (settled) return;
+      settled = true;
+      proc.kill();
+      reject(new Error('Aborted'));
+    };
+
+    if (signal) {
+      signal.addEventListener('abort', onAbort);
+    }
 
     proc.stdout.on('data', (data) => {
       stdout += data.toString();
@@ -64,10 +80,16 @@ export function runPing({ host, count, timeoutMs }) {
     });
 
     proc.on('error', (err) => {
+      if (settled) return;
+      settled = true;
+      if (signal) signal.removeEventListener('abort', onAbort);
       reject(err);
     });
 
     proc.on('close', () => {
+      if (settled) return;
+      settled = true;
+      if (signal) signal.removeEventListener('abort', onAbort);
       const combined = `${stdout}\n${stderr}`;
       resolve(parsePingOutput(combined, count));
     });

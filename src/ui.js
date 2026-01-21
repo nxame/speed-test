@@ -7,6 +7,7 @@ const COLORS = {
   cyan: '\u001b[36m',
   purple: '\u001b[35m',
   green: '\u001b[32m',
+  red: '\u001b[31m',
   dim: '\u001b[2m',
   reset: '\u001b[0m'
 };
@@ -58,6 +59,10 @@ export function createUi({ ansi, emoji, force }) {
         width - 2
       )
     );
+    if (state.networkOnline === false) {
+      const label = emoji ? '🔴 OFFLINE' : 'OFFLINE';
+      lines.push(colorize(ansi, 'red', label));
+    }
     lines.push('');
 
     if (state.downloadEnabled) {

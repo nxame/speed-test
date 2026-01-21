@@ -2,6 +2,8 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import dns from 'node:dns/promises';
+import net from 'node:net';
 import tty from 'node:tty';
 import { parseArgs, validateArgs, normalizeMode } from './args.js';
 import { runPing } from './ping.js';
@@ -43,6 +45,37 @@ function formatMbps(bytes, durationMs) {
   return (bytes * 8) / (durationMs / 1000) / 1e6;
 }
 
+async function checkOnline({ host, timeoutMs }) {
+  try {
+    await dns.lookup(host);
+  } catch (err) {
+    return { online: false, reason: `DNS lookup failed for ${host}` };
+  }
+
+  const timeout = Math.min(Math.max(1000, Math.floor(timeoutMs / 5)), 3000);
+  try {
+    await new Promise((resolve, reject) => {
+      const socket = net.connect({ host, port: 443 });
+      const timer = setTimeout(() => {
+        socket.destroy(new Error('Timeout'));
+      }, timeout);
+
+      socket.once('connect', () => {
+        clearTimeout(timer);
+        socket.end();
+        resolve();
+      });
+      socket.once('error', (err) => {
+        clearTimeout(timer);
+        reject(err);
+      });
+    });
+    return { online: true };
+  } catch (err) {
+    return { online: false, reason: `Network check failed (${err.message})` };
+  }
+}
+
 async function main() {
   const parsed = parseArgs(process.argv.slice(2));
   if (parsed.error) {
@@ -66,12 +99,53 @@ async function main() {
     process.exit(1);
   }
 
-  const { downloadEnabled, uploadEnabled } = normalizeMode(args);
   const noColor = Boolean(process.env.NO_COLOR) || args.noAnsi;
+  const serverHost = args.server ? new URL(args.server).hostname : 'speed.cloudflare.com';
+  const buildOfflineResponse = () => ({
+    version: pkg.version,
+    timestamp: new Date().toISOString(),
+    server: null,
+    ping_host: args.pingHost,
+    samples: args.samples,
+    trials: args.trials,
+    metrics: {
+      download_mbps: null,
+      upload_mbps: null,
+      latency_idle_ms: null,
+      latency_loaded_ms: null
+    },
+    errors: ['Offline']
+  });
+  const emitOffline = (hasUi) => {
+    if (args.json) {
+      console.log(JSON.stringify(buildOfflineResponse(), null, 2));
+      return;
+    }
+    if (hasUi) return;
+    const offlineEmoji = args.emoji ? '🔴 ' : '';
+    const offlineText = `${offlineEmoji}Offline`;
+    if (noColor) {
+      console.log(offlineText);
+    } else {
+      console.log(`\u001b[31m${offlineText}\u001b[0m`);
+    }
+  };
+
+  const onlineTarget = args.pingOnly ? args.pingHost : serverHost;
+  const onlineCheck = await checkOnline({ host: onlineTarget, timeoutMs: args.timeout });
+  if (!onlineCheck.online) {
+    emitOffline(false);
+    process.exitCode = 4;
+    return;
+  }
+
+  const { downloadEnabled, uploadEnabled } = normalizeMode(args);
   const isTTY = tty.isatty(process.stdout.fd);
   const useUi = !args.noUi && !args.json && (isTTY || args.forceUi);
   const ui = createUi({ ansi: !noColor, emoji: args.emoji, force: args.forceUi });
   const progressEnabled = !args.json && !useUi;
+  const abortController = new AbortController();
+  const { signal } = abortController;
 
   const errors = [];
   let exitCode = 0;
@@ -84,6 +158,7 @@ async function main() {
     serverLabel,
     downloadEnabled,
     uploadEnabled,
+    networkOnline: true,
     downloadSamples: [],
     uploadSamples: [],
     pingSamples: [],
@@ -98,21 +173,56 @@ async function main() {
     ui.render(state);
   }
 
-  const pingPromise = runPing({
+  let offlineReported = false;
+  let monitorTimer = null;
+  let monitorRunning = false;
+  const monitorHost = args.pingOnly ? args.pingHost : serverHost;
+  let pingPromise = null;
+  let loadedPingPromise = null;
+  const finishOffline = () => {
+    if (monitorTimer) clearInterval(monitorTimer);
+    if (progressEnabled) endPlainProgress();
+    if (useUi) ui.finish();
+    if (pingPromise) pingPromise.catch(() => {});
+    if (loadedPingPromise) loadedPingPromise.catch(() => {});
+    emitOffline(useUi);
+    process.exitCode = 4;
+  };
+  if (downloadEnabled || uploadEnabled || args.pingOnly) {
+    monitorTimer = setInterval(async () => {
+      if (monitorRunning || offlineReported) return;
+      monitorRunning = true;
+      try {
+        const status = await checkOnline({ host: monitorHost, timeoutMs: args.timeout });
+        if (!status.online) {
+          offlineReported = true;
+          state.networkOnline = false;
+          errors.push('Offline');
+          abortController.abort();
+          if (useUi) ui.render(state);
+        }
+      } finally {
+        monitorRunning = false;
+      }
+    }, 1500);
+  }
+
+  pingPromise = runPing({
     host: args.pingHost,
     count: args.samples,
-    timeoutMs: args.timeout
+    timeoutMs: args.timeout,
+    signal
   });
   if (progressEnabled && args.pingOnly) {
     renderPlainProgress('Running ping test...');
   }
 
-  let loadedPingPromise = null;
   if (downloadEnabled) {
     loadedPingPromise = runPing({
       host: args.pingHost,
       count: args.samples,
-      timeoutMs: args.timeout
+      timeoutMs: args.timeout,
+      signal
     });
   }
 
@@ -130,6 +240,7 @@ async function main() {
         retries: 2,
         overrideServer: args.server,
         verbose: args.verbose,
+        signal,
         onProgress: (bytes, elapsed) => {
           const mbps = formatMbps(bytes, elapsed);
           state.downloadSamples.push(mbps);
@@ -139,8 +250,15 @@ async function main() {
         }
       });
     } catch (err) {
-      errors.push(`Download failed: ${err.message}`);
+      if (!offlineReported && !signal.aborted) {
+        errors.push(`Download failed: ${err.message}`);
+      }
     }
+  }
+
+  if (offlineReported || signal.aborted) {
+    finishOffline();
+    return;
   }
 
   if (uploadEnabled) {
@@ -153,6 +271,7 @@ async function main() {
         retries: 2,
         overrideServer: args.server,
         verbose: args.verbose,
+        signal,
         onProgress: (bytes, elapsed) => {
           const mbps = formatMbps(bytes, elapsed);
           state.uploadSamples.push(mbps);
@@ -162,11 +281,34 @@ async function main() {
         }
       });
     } catch (err) {
-      errors.push(`Upload failed: ${err.message}`);
+      if (!offlineReported && !signal.aborted) {
+        errors.push(`Upload failed: ${err.message}`);
+      }
     }
   }
 
-  const pingIdle = await pingPromise;
+  if (offlineReported || signal.aborted) {
+    finishOffline();
+    return;
+  }
+
+  let pingIdle = null;
+  try {
+    pingIdle = await pingPromise;
+  } catch (err) {
+    if (offlineReported || signal.aborted) {
+      finishOffline();
+      return;
+    }
+    errors.push(`Ping failed: ${err.message}`);
+    pingIdle = {
+      samples: [],
+      median: null,
+      mean: null,
+      jitter: null,
+      lossPct: null
+    };
+  }
   state.pingSamples = pingIdle.samples;
   state.pingMedian = pingIdle.median;
   state.pingJitter = pingIdle.jitter;
@@ -175,13 +317,24 @@ async function main() {
   if (useUi) ui.render(state);
   if (progressEnabled) endPlainProgress();
   if (useUi) ui.finish();
+  if (monitorTimer) clearInterval(monitorTimer);
 
   let pingLoaded = null;
   if (loadedPingPromise) {
-    pingLoaded = await loadedPingPromise;
+    try {
+      pingLoaded = await loadedPingPromise;
+    } catch (err) {
+      if (offlineReported || signal.aborted) {
+        finishOffline();
+        return;
+      }
+      errors.push(`Loaded ping failed: ${err.message}`);
+    }
   }
 
-  if (!downloadResult && !uploadResult) {
+  if (args.pingOnly) {
+    exitCode = 0;
+  } else if (!downloadResult && !uploadResult) {
     exitCode = 2;
   } else if ((downloadEnabled && !downloadResult) || (uploadEnabled && !uploadResult)) {
     exitCode = 3;
@@ -254,10 +407,10 @@ async function main() {
     }
   }
 
-  process.exit(exitCode);
+  process.exitCode = exitCode;
 }
 
 main().catch((err) => {
   console.error(err.message || err);
-  process.exit(2);
+  process.exitCode = 2;
 });

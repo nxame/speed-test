@@ -12,5 +12,8 @@
   "files": [
     "src"
   ],
+  "scripts": {
+    "test": "node ./test/smoke.js && node ./test/cli-matrix.js"
+  },
   "license": "MIT"
 }

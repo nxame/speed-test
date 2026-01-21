@@ -86,14 +86,35 @@ async function withRetries(fn, retries) {
     try {
       return await fn(attempt);
     } catch (err) {
+      if (err && err.message === 'Aborted') {
+        throw err;
+      }
       lastError = err;
     }
   }
   throw lastError;
 }
 
-function requestDownload({ url, range, sizeBytes, timeoutMs, onProgress }) {
+function requestDownload({ url, range, sizeBytes, timeoutMs, onProgress, signal }) {
   return new Promise((resolve, reject) => {
+    let settled = false;
+    const finishResolve = () => {
+      if (settled) return;
+      settled = true;
+      const duration = performance.now() - start;
+      resolve({ bytes: measuredBytes, duration });
+    };
+    const finishReject = (err) => {
+      if (settled) return;
+      settled = true;
+      reject(err);
+    };
+
+    if (signal?.aborted) {
+      finishReject(new Error('Aborted'));
+      return;
+    }
+
     const client = getClient(url);
     const headers = {};
     if (range) headers.Range = range;
@@ -111,7 +132,7 @@ function requestDownload({ url, range, sizeBytes, timeoutMs, onProgress }) {
       },
       (res) => {
         if (res.statusCode && res.statusCode >= 400) {
-          reject(new Error(`HTTP ${res.statusCode}`));
+          finishReject(new Error(`HTTP ${res.statusCode}`));
           res.resume();
           return;
         }
@@ -133,23 +154,46 @@ function requestDownload({ url, range, sizeBytes, timeoutMs, onProgress }) {
           }
         });
 
-        res.on('end', () => {
-          const duration = performance.now() - start;
-          resolve({ bytes: measuredBytes, duration });
-        });
+        res.on('end', finishResolve);
+        res.on('close', finishResolve);
       }
     );
 
-    req.on('error', (err) => reject(err));
+    req.on('error', (err) => finishReject(err));
     req.setTimeout(timeoutMs, () => {
       req.destroy(new Error('Request timeout'));
     });
     req.end();
+
+    if (signal) {
+      signal.addEventListener('abort', () => {
+        req.destroy(new Error('Aborted'));
+        finishReject(new Error('Aborted'));
+      }, { once: true });
+    }
   });
 }
 
-function requestUpload({ url, sizeBytes, timeoutMs, onProgress }) {
+function requestUpload({ url, sizeBytes, timeoutMs, onProgress, signal }) {
   return new Promise((resolve, reject) => {
+    let settled = false;
+    const finishResolve = () => {
+      if (settled) return;
+      settled = true;
+      const duration = performance.now() - start;
+      resolve({ bytes: sent, duration });
+    };
+    const finishReject = (err) => {
+      if (settled) return;
+      settled = true;
+      reject(err);
+    };
+
+    if (signal?.aborted) {
+      finishReject(new Error('Aborted'));
+      return;
+    }
+
     const client = getClient(url);
     const start = performance.now();
     let sent = 0;
@@ -167,13 +211,12 @@ function requestUpload({ url, sizeBytes, timeoutMs, onProgress }) {
       (res) => {
         res.on('data', () => {});
         res.on('end', () => {
-          const duration = performance.now() - start;
-          resolve({ bytes: sent, duration });
+          finishResolve();
         });
       }
     );
 
-    req.on('error', (err) => reject(err));
+    req.on('error', (err) => finishReject(err));
     req.setTimeout(timeoutMs, () => {
       req.destroy(new Error('Request timeout'));
     });
@@ -183,8 +226,17 @@ function requestUpload({ url, sizeBytes, timeoutMs, onProgress }) {
       const elapsed = performance.now() - start;
       if (onProgress) onProgress(sent, elapsed);
     });
+    stream.on('error', (err) => finishReject(err));
 
     stream.pipe(req);
+
+    if (signal) {
+      signal.addEventListener('abort', () => {
+        stream.destroy(new Error('Aborted'));
+        req.destroy(new Error('Aborted'));
+        finishReject(new Error('Aborted'));
+      }, { once: true });
+    }
   });
 }
 
@@ -196,8 +248,12 @@ export async function runDownloadTrials({
   retries,
   onProgress,
   overrideServer,
-  verbose
+  verbose,
+  signal
 }) {
+  if (signal?.aborted) {
+    throw new Error('Aborted');
+  }
   const candidates = overrideServer
     ? [{ name: 'custom', base: overrideServer, type: 'query', path: '/__down', param: 'bytes' }]
     : DEFAULT_DOWNLOAD;
@@ -210,6 +266,9 @@ export async function runDownloadTrials({
 
     try {
       for (let i = 0; i < trials; i += 1) {
+        if (signal?.aborted) {
+          throw new Error('Aborted');
+        }
         const result = await withRetries(async () => {
           const perStreamBytes = Math.ceil(totalSize / concurrency);
           const streams = [];
@@ -220,7 +279,8 @@ export async function runDownloadTrials({
                 range,
                 sizeBytes: perStreamBytes,
                 timeoutMs,
-                onProgress: onProgress ? (bytes, elapsed) => onProgress(bytes, elapsed, i) : null
+                onProgress: onProgress ? (bytes, elapsed) => onProgress(bytes, elapsed, i) : null,
+                signal
               })
             );
           }
@@ -250,8 +310,12 @@ export async function runUploadTrials({
   retries,
   onProgress,
   overrideServer,
-  verbose
+  verbose,
+  signal
 }) {
+  if (signal?.aborted) {
+    throw new Error('Aborted');
+  }
   const candidates = overrideServer
     ? [{ name: 'custom', base: overrideServer, path: '/__up' }]
     : DEFAULT_UPLOAD;
@@ -263,12 +327,16 @@ export async function runUploadTrials({
 
     try {
       for (let i = 0; i < trials; i += 1) {
+        if (signal?.aborted) {
+          throw new Error('Aborted');
+        }
         const result = await withRetries(() =>
           requestUpload({
             url,
             sizeBytes,
             timeoutMs,
-            onProgress: onProgress ? (bytes, elapsed) => onProgress(bytes, elapsed, i) : null
+            onProgress: onProgress ? (bytes, elapsed) => onProgress(bytes, elapsed, i) : null,
+            signal
           }), retries);
         trialResults.push(result);
       }

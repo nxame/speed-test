@@ -113,6 +113,7 @@ NO_COLOR=1 net-speed
 ## Notes
 
 - Download/upload tests stream data and avoid large buffers.
+- If the network drops during a run, the test fails fast and reports `Offline`.
 - `NO_COLOR=1` disables ANSI colors automatically.
 - If stdout is not a TTY, UI mode is disabled unless `--force-ui` is provided.
 
